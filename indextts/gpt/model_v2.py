@@ -6,12 +6,11 @@ import torch.nn.functional as F
 
 import transformers
 from transformers import GPT2Config, LogitsProcessorList
-from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
+from transformers.generation import GenerationMixin
+from transformers.modeling_utils import PreTrainedModel
 
 # from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
-from transformers.utils.model_parallel_utils import (assert_device_map,
-                                                     get_device_map)
 
 from indextts.gpt.conformer_encoder import ConformerEncoder
 from indextts.gpt.perceiver import PerceiverResampler
@@ -43,7 +42,7 @@ class ResBlock(nn.Module):
         return F.relu(self.net(x) + x)
 
 
-class GPT2InferenceModel(GPT2PreTrainedModel):
+class GPT2InferenceModel(PreTrainedModel, GenerationMixin):
     def __init__(self, config, gpt, text_pos_emb, embeddings, norm, linear, kv_cache=False):
         super().__init__(config)
         # Note: the argument named `text_pos_emb` here actually represents the mel position embedding
@@ -60,6 +59,10 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         self.cached_mel_emb = None
 
     def parallelize(self, device_map=None):
+        try:
+            from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
+        except ImportError as exc:
+            raise NotImplementedError('Transformers 5 不支持此旧版模型并行接口') from exc
         self.device_map = (
             get_device_map(len(self.transformer.h), range(max(1, torch.cuda.device_count())))
             if device_map is None
@@ -92,8 +95,14 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         token_type_ids = kwargs.get("token_type_ids", None)  # usually None
         if not self.kv_cache:
             past_key_values = None
+        if past_key_values is None:
+            has_past = False
+        elif hasattr(past_key_values, "get_seq_length"):
+            has_past = past_key_values.get_seq_length() > 0
+        else:
+            has_past = bool(past_key_values)
         # only last token for inputs_ids if past is defined in kwargs
-        if past_key_values:
+        if has_past:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
                 token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
@@ -105,7 +114,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
-            if past_key_values:
+            if has_past:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
             position_ids = None
@@ -204,6 +213,9 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         :meth:`~transformers.PreTrainedModel.beam_search` or :meth:`~transformers.PreTrainedModel.beam_sample` is
         called. This is required to match :obj:`past_key_values` with the correct beam_idx at every generation step.
         """
+        if hasattr(past, "reorder_cache"):
+            past.reorder_cache(beam_idx)
+            return past
         return tuple(
             tuple(
                 past_state.index_select(0, beam_idx.to(past_state.device))
